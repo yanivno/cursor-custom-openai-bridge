@@ -38,17 +38,19 @@ function loadConfig() {
     for (const m of config.custom_models || []) {
       const fxName = MODEL_PREFIX + m.model;
       const provider = m.provider || "generic-chat-completion-api";
-      const isAnthropic =
-        provider === "anthropic" &&
-        !m.base_url.startsWith("http://127.0.0.1:8318");
+      const isAnthropic = provider === "anthropic";
       let upstreamBase = m.base_url;
+      const isLocalOpenAICompatAnthropic =
+        provider === "anthropic" &&
+        /^http:\/\/127\.0\.0\.1:8318(?:\/v1)?\/?$/.test(upstreamBase);
 
       const route = {
         model: m.model,
         baseUrl: upstreamBase,
         apiKey: m.api_key,
         provider,
-        isAnthropic,
+        isAnthropic: isAnthropic && !isLocalOpenAICompatAnthropic,
+        isLocalOpenAICompatAnthropic,
         extraHeaders: m.extra_headers || m.headers || {},
         extraArgs: m.extra_args || {},
         supportsImages: m.supports_images !== false,
@@ -117,25 +119,93 @@ function makeChunk(id, model, opts = {}) {
   };
 }
 
+function normalizeAnthropicContent(content) {
+  if (typeof content === "string") {
+    return content.trim() ? [{ type: "text", text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const normalized = [];
+  for (const part of content) {
+    if (!part) continue;
+    if (typeof part === "string") {
+      if (part.trim()) normalized.push({ type: "text", text: part });
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      normalized.push({ type: "text", text: part.text });
+      continue;
+    }
+    if (part.type === "image_url" && part.image_url?.url) {
+      normalized.push({
+        type: "image",
+        source: {
+          type: "url",
+          url: part.image_url.url,
+        },
+      });
+      continue;
+    }
+    if (part.type === "input_text" && typeof part.text === "string" && part.text.trim()) {
+      normalized.push({ type: "text", text: part.text });
+    }
+  }
+  return normalized;
+}
+
+function normalizeOpenAIContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const textParts = [];
+  for (const part of content) {
+    if (!part) continue;
+    if (typeof part === "string") {
+      if (part.trim()) textParts.push(part);
+      continue;
+    }
+    if (part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+      textParts.push(part.text);
+      continue;
+    }
+    if (part.type === "input_text" && typeof part.text === "string" && part.text.trim()) {
+      textParts.push(part.text);
+    }
+  }
+  return textParts.join("\n");
+}
+
+function sanitizeOpenAIMessages(messages = []) {
+  const sanitized = [];
+  for (const msg of messages) {
+    if (!msg || !msg.role) continue;
+    const content = normalizeOpenAIContent(msg.content);
+    if (!content.trim() && msg.role !== "assistant") continue;
+    sanitized.push({
+      role: msg.role,
+      content,
+    });
+  }
+  return sanitized;
+}
+
 function openaiToAnthropic(body) {
   const messages = body.messages || [];
   const systemParts = [];
   const converted = [];
   for (const msg of messages) {
+    const normalizedContent = normalizeAnthropicContent(msg.content);
     if (msg.role === "system") {
-      const text =
-        typeof msg.content === "string"
-          ? msg.content
-          : Array.isArray(msg.content)
-            ? msg.content
-                .filter((p) => p.type === "text")
-                .map((p) => p.text)
-                .join("")
-            : String(msg.content);
-      systemParts.push(text);
-    } else {
-      converted.push({ role: msg.role, content: msg.content });
+      const text = normalizedContent
+        .filter((p) => p.type === "text")
+        .map((p) => p.text)
+        .join("");
+      if (text.trim()) systemParts.push(text);
+      continue;
     }
+    if (!["user", "assistant"].includes(msg.role)) continue;
+    if (normalizedContent.length === 0) continue;
+    converted.push({ role: msg.role, content: normalizedContent });
   }
   const result = {
     model: body.model,
@@ -210,7 +280,11 @@ function proxyUpstream(route, body, isStream, req, res) {
     } else {
       url = new URL(base + "/chat/completions");
     }
-    payload = JSON.stringify(body);
+    const openaiBody = {
+      ...body,
+      messages: sanitizeOpenAIMessages(body.messages),
+    };
+    payload = JSON.stringify(openaiBody);
     headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${route.apiKey}`,
