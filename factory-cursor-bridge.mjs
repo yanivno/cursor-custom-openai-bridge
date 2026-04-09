@@ -210,6 +210,87 @@ function sanitizeOpenAIMessages(messages = []) {
   return sanitized;
 }
 
+// Convert OpenAI Responses API 'input' format to Chat Completions 'messages' format
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  // 'instructions' in Responses API maps to a system message
+  if (instructions && typeof instructions === "string" && instructions.trim()) {
+    messages.push({ role: "system", content: instructions });
+  }
+  if (typeof input === "string") {
+    // Simple string input -> single user message
+    messages.push({ role: "user", content: input });
+    return messages;
+  }
+  if (!Array.isArray(input)) return messages;
+  for (const item of input) {
+    if (!item) continue;
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+    // Responses API message objects have 'role' and 'content'
+    if (item.role && item.content !== undefined) {
+      const role = item.role === "developer" ? "system" : item.role;
+      let content;
+      if (typeof item.content === "string") {
+        content = item.content;
+      } else if (Array.isArray(item.content)) {
+        // Extract text from content parts
+        content = item.content
+          .map((p) => {
+            if (typeof p === "string") return p;
+            if (p?.type === "input_text" || p?.type === "text") return p.text || "";
+            if (p?.type === "output_text") return p.text || "";
+            return "";
+          })
+          .filter(Boolean)
+          .join("\n");
+      } else {
+        content = String(item.content || "");
+      }
+      if (content.trim() || role === "assistant") {
+        messages.push({ role, content });
+      }
+      continue;
+    }
+    // Bare content part objects (e.g. { type: "input_text", text: "..." })
+    if (item.type === "input_text" && item.text) {
+      messages.push({ role: "user", content: item.text });
+    }
+  }
+  return messages;
+}
+
+// Convert Responses API tool format to Chat Completions tool format
+// Only function tools are supported by /v1/chat/completions; other types are dropped.
+function convertResponsesTools(tools) {
+  if (!Array.isArray(tools)) return tools;
+  const converted = [];
+  for (const tool of tools) {
+    // Already in Chat Completions format (has tool.function)
+    if (tool.type === "function" && tool.function) {
+      converted.push(tool);
+      continue;
+    }
+    // Responses API format: { type: "function", name: "...", description: "...", parameters: {...} }
+    if (tool.type === "function" && tool.name && !tool.function) {
+      converted.push({
+        type: "function",
+        function: {
+          name: tool.name,
+          ...(tool.description !== undefined && { description: tool.description }),
+          ...(tool.parameters !== undefined && { parameters: tool.parameters }),
+          ...(tool.strict !== undefined && { strict: tool.strict }),
+        },
+      });
+      continue;
+    }
+    // Drop non-function tools (mcp, computer_use, custom, etc.) — unsupported by Chat Completions API
+  }
+  return converted;
+}
+
 function openAINonStreamToSSE(parsed, fxModel, chatId, res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -318,11 +399,46 @@ function proxyUpstream(route, body, isStream, req, res) {
     } else {
       url = new URL(base + "/chat/completions");
     }
+    // Allowlist of valid /v1/chat/completions parameters — strip everything else
+    const CHAT_COMPLETIONS_PARAMS = new Set([
+      'model', 'messages', 'stream', 'stream_options',
+      'temperature', 'top_p', 'n', 'max_tokens', 'max_completion_tokens',
+      'stop', 'presence_penalty', 'frequency_penalty', 'logit_bias',
+      'logprobs', 'top_logprobs', 'response_format', 'seed',
+      'tools', 'tool_choice', 'parallel_tool_calls',
+      'user', 'function_call', 'functions',
+      'service_tier', 'modalities', 'audio', 'prediction', 'web_search_options',
+    ]);
+    const chatBody = {};
+    const stripped = [];
+    for (const [key, value] of Object.entries(body)) {
+      if (CHAT_COMPLETIONS_PARAMS.has(key)) {
+        chatBody[key] = value;
+      } else {
+        stripped.push(key);
+      }
+    }
+    if (stripped.length) {
+      log(`Stripped non-Chat-Completions params from ${fxModel}: ${stripped.join(', ')}`);
+    }
+    // Recover input/instructions for message conversion
+    const input = body.input;
+    const instructions = body.instructions;
+    // Convert Responses API 'input' to Chat Completions 'messages' when messages are missing
+    let messages = chatBody.messages;
+    if ((!messages || messages.length === 0) && input) {
+      messages = responsesInputToMessages(input, instructions);
+      log(`Converted Responses API input to ${messages.length} messages for ${fxModel}`);
+    }
     let openaiBody = {
-      ...body,
-      stream: forceNonStreamForLocalClaude ? false : body.stream,
-      messages: sanitizeOpenAIMessages(body.messages),
+      ...chatBody,
+      stream: forceNonStreamForLocalClaude ? false : chatBody.stream,
+      messages: sanitizeOpenAIMessages(messages || []),
     };
+    // Convert Responses API tool format if needed
+    if (openaiBody.tools) {
+      openaiBody.tools = convertResponsesTools(openaiBody.tools);
+    }
     if (route.isLocalOpenAICompatAnthropic) {
       openaiBody = {
         model: realModel,

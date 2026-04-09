@@ -1,0 +1,18 @@
+{
+  "custom_models": [
+    {
+      "model": "azure-gpt-5-4-nano",
+      "model_display_name": "azure-gpt-5-4-nano",
+      "base_url": "https://<your-resource>.services.ai.azure.com/api/projects/<your-project>/openai/v1",
+      "api_key": "<your-azure-api-key>",
+      "provider": "openai"
+    },
+    {
+      "model": "claude-opus-4-6",
+      "model_display_name": "claude-opus-4-6",
+      "base_url": "https://api.anthropic.com/v1",
+      "api_key": "<your-anthropic-api-key>",
+      "provider": "anthropic"
+    }
+  ]
+}
