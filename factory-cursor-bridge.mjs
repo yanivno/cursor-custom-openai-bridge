@@ -5,6 +5,7 @@ import { readFileSync, watchFile } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
 
 const PORT = parseInt(process.env.FACTORY_CURSOR_PORT || "8316", 10);
 const HOST = process.env.FACTORY_CURSOR_HOST || "127.0.0.1";
@@ -29,6 +30,39 @@ const PREFIX_PATTERNS = {
 let routeTable = new Map();
 let modelList = [];
 
+// Entra ID (Azure AD) token cache: { resource -> { token, expiresOn } }
+const entraTokenCache = new Map();
+const ENTRA_DEFAULT_RESOURCE = "https://cognitiveservices.azure.com";
+
+function getEntraToken(resource = ENTRA_DEFAULT_RESOURCE) {
+  const cached = entraTokenCache.get(resource);
+  const now = Date.now();
+  // Reuse cached token if it has more than 2 minutes of validity left
+  if (cached && cached.expiresOn - now > 2 * 60 * 1000) {
+    return cached.token;
+  }
+  try {
+    const raw = execSync(
+      `az account get-access-token --resource ${resource} --query '{accessToken:accessToken,expiresOn:expiresOn}' -o json`,
+      { encoding: "utf-8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const result = JSON.parse(raw);
+    const token = result.accessToken;
+    const expiresOn = new Date(result.expiresOn).getTime();
+    entraTokenCache.set(resource, { token, expiresOn });
+    log(`Entra token acquired for ${resource} (expires ${new Date(expiresOn).toISOString()})`);
+    return token;
+  } catch (e) {
+    log(`ERROR acquiring Entra token for ${resource}: ${e.message}`);
+    // Return stale cached token as fallback if available
+    if (cached) {
+      log(`Using expired Entra token as fallback`);
+      return cached.token;
+    }
+    throw new Error(`Failed to acquire Entra token: ${e.message}. Ensure 'az login' has been run.`);
+  }
+}
+
 function loadConfig() {
   try {
     const raw = readFileSync(CONFIG_PATH, "utf-8");
@@ -44,6 +78,7 @@ function loadConfig() {
         provider === "anthropic" &&
         /^http:\/\/127\.0\.0\.1:8318(?:\/v1)?\/?$/.test(upstreamBase);
 
+      const useEntraAuth = !m.api_key;
       const route = {
         model: m.model,
         baseUrl: upstreamBase,
@@ -55,6 +90,8 @@ function loadConfig() {
         extraArgs: m.extra_args || {},
         supportsImages: m.supports_images !== false,
         displayName: m.model_display_name || m.model,
+        useEntraAuth,
+        entraResource: m.entra_resource || ENTRA_DEFAULT_RESOURCE,
       };
 
       // Register with fx- prefix
@@ -88,7 +125,8 @@ function loadConfig() {
     }
     routeTable = newRoutes;
     modelList = newModels;
-    log(`Loaded ${newRoutes.size} model routes (${config.custom_models?.length || 0} base models)`);
+    const entraCount = [...newRoutes.values()].filter(r => r.useEntraAuth).length;
+    log(`Loaded ${newRoutes.size} model routes (${config.custom_models?.length || 0} base models${entraCount ? `, ${entraCount} using Entra auth` : ''})`);
   } catch (e) {
     log(`ERROR loading config: ${e.message}`);
   }
@@ -378,6 +416,21 @@ function proxyUpstream(route, body, isStream, req, res) {
 
   let url, headers, payload;
 
+  // Resolve API key: use Entra token if api_key is empty
+  let resolvedApiKey = route.apiKey;
+  if (route.useEntraAuth) {
+    try {
+      resolvedApiKey = getEntraToken(route.entraResource);
+    } catch (e) {
+      log(`Entra auth failed for ${fxModel}: ${e.message}`);
+      if (!res.headersSent) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+      }
+      res.end(JSON.stringify({ error: { message: e.message } }));
+      return;
+    }
+  }
+
   if (route.isAnthropic) {
     const anthropicBody = openaiToAnthropic(body);
     let base = route.baseUrl.replace(/\/+$/, "");
@@ -387,7 +440,7 @@ function proxyUpstream(route, body, isStream, req, res) {
     payload = JSON.stringify(anthropicBody);
     headers = {
       "Content-Type": "application/json",
-      "x-api-key": route.apiKey,
+      "x-api-key": resolvedApiKey,
       "anthropic-version": "2023-06-01",
       ...route.extraHeaders,
     };
@@ -451,7 +504,7 @@ function proxyUpstream(route, body, isStream, req, res) {
     payload = JSON.stringify(openaiBody);
     headers = {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${route.apiKey}`,
+      Authorization: `Bearer ${resolvedApiKey}`,
       ...route.extraHeaders,
     };
   }
